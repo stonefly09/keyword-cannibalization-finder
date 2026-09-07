@@ -28,6 +28,28 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1500px;}
+    .seo-card {
+        border: 1px solid rgba(128,128,128,.20);
+        border-radius: 14px;
+        padding: 16px 18px;
+        background: rgba(250,250,250,.02);
+        min-height: 170px;
+    }
+    .seo-card h4 {margin: 0 0 10px 0; font-size: 1rem;}
+    .seo-url {font-size: .88rem; word-break: break-all; line-height: 1.35;}
+    .seo-kpi {font-size: 1.55rem; font-weight: 700; margin: 4px 0;}
+    .seo-muted {opacity: .72; font-size: .86rem;}
+    .score-high {font-weight: 700;}
+    div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.14); padding: 10px 12px; border-radius: 12px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def normalize_query(value: str) -> str:
     return re.sub(r"\s+", " ", str(value).strip().lower())
@@ -157,6 +179,28 @@ def recommendation(primary_pos: float, secondary_pos: float, secondary_share: fl
         "Review the overlap before changing anything. Differentiate targeting if the pages serve "
         "different intents; consolidate only if they are genuinely redundant."
     )
+
+
+def compact_url(url: str, max_len: int = 72) -> str:
+    text = str(url).strip()
+    text = re.sub(r"^https?://", "", text)
+    text = text.rstrip("/")
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def score_breakdown(total_impressions: float, second_share: float, pos1: float, pos2: float) -> dict:
+    share_points = 45 * min(second_share / 0.50, 1.0)
+    demand_points = 20 * min(total_impressions / 1000.0, 1.0)
+    top20_points = 20 if pos1 <= 20 and pos2 <= 20 else 0
+    proximity_points = 15 if abs(pos1 - pos2) <= 5 else 0
+    return {
+        "Competing URL share": round(share_points, 1),
+        "Keyword demand": round(demand_points, 1),
+        "Both URLs in Top 20": top20_points,
+        "Rankings within 5 positions": proximity_points,
+    }
 
 
 def detect_cannibalization(
@@ -738,7 +782,7 @@ if not df.empty:
         st.error(str(exc))
         st.stop()
 
-    st.subheader("3. Cannibalization candidates")
+    st.subheader("3. Cannibalization opportunities")
 
     if summary.empty:
         st.success("No candidates matched the current thresholds.")
@@ -750,17 +794,33 @@ if not df.empty:
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Candidates", f"{len(summary):,}")
-        m2.metric("High", f"{high_count:,}")
+        m2.metric("High priority", f"{high_count:,}")
         m3.metric("Medium", f"{medium_count:,}")
         m4.metric("Low", f"{low_count:,}")
-        m5.metric("Candidate impressions", f"{total_imp:,}")
+        m5.metric("Affected impressions", f"{total_imp:,}")
 
-        f1, f2, f3 = st.columns([2, 1, 1])
-        query_filter = f1.text_input("Filter queries", placeholder="nas storage")
+        with st.expander("How the 0–100 score works", expanded=False):
+            st.markdown(
+                """
+                **The score is a prioritization metric created by this tool — it is not a Google metric.**
+
+                - Up to **45 points**: how much impression share the strongest competing URL receives.
+                - Up to **20 points**: total impressions for the keyword.
+                - **20 points**: both primary and competing URLs rank in the Top 20.
+                - **15 points**: their average rankings are within 5 positions of each other.
+
+                **70–100 = High**, **45–69 = Medium**, **0–44 = Low**. Always compare search intent before consolidating pages.
+                """
+            )
+
+        st.markdown("#### Find an opportunity")
+        f1, f2, f3, f4 = st.columns([2.2, 1.2, 1.2, 1.2])
+        query_filter = f1.text_input("Search keyword", placeholder="e.g. air gapped backup")
         severity_filter = f2.multiselect(
             "Severity", ["High", "Medium", "Low"], default=["High", "Medium", "Low"]
         )
         min_score_filter = f3.slider("Minimum score", 0, 100, 0)
+        sort_by = f4.selectbox("Sort by", ["Score", "Impressions", "URLs", "Position gap"])
 
         filtered = summary.copy()
         if query_filter.strip():
@@ -771,27 +831,50 @@ if not df.empty:
             filtered["severity"].isin(severity_filter) & (filtered["score"] >= min_score_filter)
         ]
 
-        display_cols = [
-            "query",
-            "severity",
-            "conflict_type",
-            "score",
-            "urls",
-            "impressions",
-            "primary_url",
-            "primary_position",
-            "primary_impression_share",
-            "competing_url",
-            "competing_position",
-            "competing_impression_share",
-            "position_gap",
-            "recommendation",
-        ]
-        st.dataframe(
-            format_summary_for_display(filtered)[display_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+        sort_map = {
+            "Score": ("score", False),
+            "Impressions": ("impressions", False),
+            "URLs": ("urls", False),
+            "Position gap": ("position_gap", True),
+        }
+        sort_col, ascending = sort_map[sort_by]
+        filtered = filtered.sort_values(sort_col, ascending=ascending)
+
+        if filtered.empty:
+            st.warning("No opportunities match the current filters.")
+        else:
+            compact = filtered.copy()
+            compact["Primary URL"] = compact["primary_url"].map(compact_url)
+            compact["Main competing URL"] = compact["competing_url"].map(compact_url)
+            compact = compact.rename(
+                columns={
+                    "query": "Keyword",
+                    "severity": "Severity",
+                    "score": "Score",
+                    "urls": "URLs",
+                    "impressions": "Impressions",
+                    "primary_position": "Primary pos.",
+                    "competing_position": "Competing pos.",
+                    "position_gap": "Gap",
+                }
+            )
+            compact_cols = [
+                "Keyword", "Severity", "Score", "URLs", "Impressions",
+                "Primary URL", "Primary pos.", "Main competing URL", "Competing pos.", "Gap"
+            ]
+            st.dataframe(
+                compact[compact_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+                    "Impressions": st.column_config.NumberColumn("Impressions", format="%d"),
+                    "Primary pos.": st.column_config.NumberColumn("Primary pos.", format="%.2f"),
+                    "Competing pos.": st.column_config.NumberColumn("Competing pos.", format="%.2f"),
+                    "Gap": st.column_config.NumberColumn("Gap", format="%.2f"),
+                },
+                height=min(520, 44 + 36 * len(compact)),
+            )
 
         d1, d2, d3 = st.columns(3)
         d1.download_button(
@@ -799,48 +882,130 @@ if not df.empty:
             data=summary.to_csv(index=False).encode("utf-8"),
             file_name="keyword_cannibalization_candidates.csv",
             mime="text/csv",
+            use_container_width=True,
         )
         d2.download_button(
-            "Download URL-level details",
+            "Download all conflicting URLs",
             data=details.to_csv(index=False).encode("utf-8"),
             file_name="keyword_cannibalization_details.csv",
             mime="text/csv",
+            use_container_width=True,
         )
         d3.download_button(
             "Download source query × page data",
             data=aggregate_query_page(df).to_csv(index=False).encode("utf-8"),
             file_name="query_page_source_data.csv",
             mime="text/csv",
+            use_container_width=True,
         )
 
-        st.subheader("4. Inspect one query")
-        selected_query = st.selectbox("Query", summary["query"].tolist())
+        st.divider()
+        st.subheader("4. Inspect a keyword conflict")
+        query_options = filtered["query"].tolist() if not filtered.empty else summary["query"].tolist()
+        selected_query = st.selectbox("Select keyword", query_options)
         selected_summary = summary[summary["query"] == selected_query].iloc[0]
         query_details = (
             details[details["query"] == selected_query]
             .copy()
-            .sort_values("impressions", ascending=False)
+            .sort_values(["impressions", "clicks"], ascending=False)
+            .reset_index(drop=True)
         )
 
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Priority score", int(selected_summary["score"]))
+        score_value = int(selected_summary["score"])
+        a1, a2, a3, a4, a5 = st.columns(5)
+        a1.metric("Priority score", score_value)
         a2.metric("Severity", selected_summary["severity"])
         a3.metric("Ranking URLs", int(selected_summary["urls"]))
-        a4.metric("Position gap", selected_summary["position_gap"])
+        a4.metric("Total impressions", f"{int(selected_summary['impressions']):,}")
+        a5.metric("Primary vs competitor gap", selected_summary["position_gap"])
+        st.progress(score_value / 100.0)
+
+        primary_row = query_details.iloc[0]
+        competitor_row = query_details.iloc[1]
+        c_primary, c_vs, c_comp = st.columns([1, 0.16, 1])
+        with c_primary:
+            st.markdown(
+                f"""
+                <div class="seo-card">
+                    <h4>Primary URL</h4>
+                    <div class="seo-url"><a href="{primary_row['page']}" target="_blank">{compact_url(primary_row['page'], 95)}</a></div>
+                    <div class="seo-kpi">Position {float(primary_row['position']):.2f}</div>
+                    <div class="seo-muted">{int(primary_row['impressions']):,} impressions · {float(primary_row['impression_share'])*100:.1f}% share · {int(primary_row['clicks']):,} clicks</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with c_vs:
+            st.markdown("<div style='text-align:center;padding-top:65px;font-weight:700;'>VS</div>", unsafe_allow_html=True)
+        with c_comp:
+            st.markdown(
+                f"""
+                <div class="seo-card">
+                    <h4>Main competing URL</h4>
+                    <div class="seo-url"><a href="{competitor_row['page']}" target="_blank">{compact_url(competitor_row['page'], 95)}</a></div>
+                    <div class="seo-kpi">Position {float(competitor_row['position']):.2f}</div>
+                    <div class="seo-muted">{int(competitor_row['impressions']):,} impressions · {float(competitor_row['impression_share'])*100:.1f}% share · {int(competitor_row['clicks']):,} clicks</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("#### Recommended next step")
         st.info(selected_summary["recommendation"])
 
-        chart_df = query_details.set_index("page")[["impressions"]]
-        st.bar_chart(chart_df)
+        breakdown = score_breakdown(
+            float(selected_summary["impressions"]),
+            float(selected_summary["competing_impression_share"]),
+            float(selected_summary["primary_position"]),
+            float(selected_summary["competing_position"]),
+        )
+        with st.expander("Why this keyword received this score", expanded=False):
+            b1, b2, b3, b4 = st.columns(4)
+            values = list(breakdown.items())
+            for col, (label, value) in zip([b1, b2, b3, b4], values):
+                max_points = {"Competing URL share": 45, "Keyword demand": 20, "Both URLs in Top 20": 20, "Rankings within 5 positions": 15}[label]
+                col.metric(label, f"{value:g}/{max_points}")
 
-        display_details = query_details.copy()
-        display_details["ctr"] = (display_details["ctr"] * 100).round(2).astype(str) + "%"
-        display_details["impression_share"] = (
-            display_details["impression_share"] * 100
-        ).round(1).astype(str) + "%"
-        st.dataframe(display_details, use_container_width=True, hide_index=True)
+        st.markdown("#### All URLs ranking for this keyword")
+        all_urls = query_details.copy()
+        all_urls.insert(0, "Role", ["Primary"] + ["Competitor"] * (len(all_urls) - 1))
+        all_urls["URL"] = all_urls["page"].map(compact_url)
+        all_urls["CTR"] = (all_urls["ctr"] * 100).round(2)
+        all_urls["Impression share"] = (all_urls["impression_share"] * 100).round(1)
+        all_urls = all_urls.rename(
+            columns={"clicks": "Clicks", "impressions": "Impressions", "position": "Position"}
+        )
+        st.dataframe(
+            all_urls[["Role", "URL", "Clicks", "Impressions", "CTR", "Position", "Impression share"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "CTR": st.column_config.NumberColumn("CTR", format="%.2f%%"),
+                "Position": st.column_config.NumberColumn("Position", format="%.2f"),
+                "Impression share": st.column_config.ProgressColumn(
+                    "Impression share", min_value=0, max_value=100, format="%.1f%%"
+                ),
+            },
+        )
+
+        if len(query_details) > 2:
+            with st.expander(f"Show {len(query_details)-2} additional competing URLs", expanded=False):
+                for idx, row in query_details.iloc[2:].iterrows():
+                    st.markdown(
+                        f"**{idx+1}. [{compact_url(row['page'], 100)}]({row['page']})**  · "
+                        f"Position **{float(row['position']):.2f}** · "
+                        f"{int(row['impressions']):,} impressions · "
+                        f"{float(row['impression_share'])*100:.1f}% share"
+                    )
+
+        st.markdown("#### Impression split across ranking URLs")
+        chart_df = query_details.copy()
+        chart_df["URL"] = chart_df["page"].map(lambda x: compact_url(x, 55))
+        chart_df = chart_df.set_index("URL")[["impressions"]]
+        st.bar_chart(chart_df)
 
 st.divider()
 st.caption(
-    "v3 · Google OAuth + service-account JSON + CSV · query × page overlap scoring. "
+    "v5 · Improved conflict-first UI · Google OAuth + service-account JSON + CSV · query × page overlap scoring. "
     "Planned next: daily URL-switching detection and page-intent similarity."
 )
