@@ -1,8 +1,13 @@
+import base64
+import hashlib
+import hmac
 import io
 import json
 import re
+import secrets
+import time
 from datetime import date, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 import requests
@@ -12,6 +17,9 @@ from google.oauth2 import service_account
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 GSC_API_BASE = "https://www.googleapis.com/webmasters/v3"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 REQUIRED_COLUMNS = {"query", "page", "clicks", "impressions", "ctr", "position"}
 
 st.set_page_config(
@@ -360,23 +368,139 @@ def service_account_token(uploaded_file) -> tuple[str, str]:
     return credentials.token, info.get("client_email", "Unknown service account")
 
 
-def oauth_status() -> tuple[bool, str | None]:
+def _oauth_config() -> dict:
     try:
-        if bool(st.user.is_logged_in):
-            return True, getattr(st.user, "email", None)
-        return False, None
-    except Exception:
-        return False, None
+        cfg = st.secrets["google_oauth"]
+        required = ["client_id", "client_secret", "cookie_secret", "redirect_uri"]
+        missing = [key for key in required if not cfg.get(key)]
+        if missing:
+            raise RuntimeError("Missing Streamlit secret(s): " + ", ".join(missing))
+        return {key: str(cfg[key]) for key in required}
+    except Exception as exc:
+        raise RuntimeError(
+            "Google OAuth is not configured. Add a [google_oauth] section in Streamlit Secrets."
+        ) from exc
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _make_oauth_state(cookie_secret: str) -> str:
+    payload = {"ts": int(time.time()), "nonce": secrets.token_urlsafe(18)}
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    sig = hmac.new(cookie_secret.encode("utf-8"), raw, hashlib.sha256).digest()
+    return _b64url(raw) + "." + _b64url(sig)
+
+
+def _verify_oauth_state(state: str, cookie_secret: str, max_age: int = 900) -> None:
+    try:
+        raw_part, sig_part = state.split(".", 1)
+        raw = _b64url_decode(raw_part)
+        supplied = _b64url_decode(sig_part)
+        expected = hmac.new(cookie_secret.encode("utf-8"), raw, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied, expected):
+            raise ValueError("signature mismatch")
+        payload = json.loads(raw.decode("utf-8"))
+        ts = int(payload["ts"])
+        if abs(int(time.time()) - ts) > max_age:
+            raise ValueError("state expired")
+    except Exception as exc:
+        raise RuntimeError("Google login state is invalid or expired. Start the login again.") from exc
+
+
+def google_login_url() -> str:
+    cfg = _oauth_config()
+    state = _make_oauth_state(cfg["cookie_secret"])
+    params = {
+        "client_id": cfg["client_id"],
+        "redirect_uri": cfg["redirect_uri"],
+        "response_type": "code",
+        "scope": "openid email profile " + SCOPES[0],
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "select_account",
+        "state": state,
+    }
+    return GOOGLE_AUTH_URL + "?" + urlencode(params)
+
+
+def _exchange_google_code(code: str, state: str) -> None:
+    cfg = _oauth_config()
+    _verify_oauth_state(state, cfg["cookie_secret"])
+    response = requests.post(
+        GOOGLE_TOKEN_URL,
+        data={
+            "code": code,
+            "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "redirect_uri": cfg["redirect_uri"],
+            "grant_type": "authorization_code",
+        },
+        timeout=30,
+    )
+    if not response.ok:
+        try:
+            detail = response.json().get("error_description") or response.json().get("error")
+        except Exception:
+            detail = response.text[:300]
+        raise RuntimeError(f"Google token exchange failed: {detail}")
+
+    token = response.json()
+    access_token = token.get("access_token")
+    if not access_token:
+        raise RuntimeError("Google did not return an access token.")
+
+    user_resp = requests.get(
+        GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=20
+    )
+    user = user_resp.json() if user_resp.ok else {}
+    st.session_state["google_oauth_token"] = access_token
+    st.session_state["google_oauth_email"] = user.get("email", "Google user")
+    st.session_state["google_oauth_expires_at"] = int(time.time()) + int(token.get("expires_in", 3600))
+
+
+def handle_google_oauth_callback() -> None:
+    code = st.query_params.get("code")
+    state = st.query_params.get("state")
+    error = st.query_params.get("error")
+    if error:
+        st.query_params.clear()
+        raise RuntimeError(f"Google sign-in was not completed: {error}")
+    if code and state:
+        _exchange_google_code(str(code), str(state))
+        st.query_params.clear()
+        st.rerun()
+
+
+def oauth_status() -> tuple[bool, str | None]:
+    token = st.session_state.get("google_oauth_token")
+    expires_at = int(st.session_state.get("google_oauth_expires_at", 0) or 0)
+    if token and expires_at > int(time.time()) + 30:
+        return True, st.session_state.get("google_oauth_email")
+    if token:
+        st.session_state.pop("google_oauth_token", None)
+        st.session_state.pop("google_oauth_email", None)
+        st.session_state.pop("google_oauth_expires_at", None)
+    return False, None
 
 
 def oauth_access_token() -> str:
-    try:
-        return st.user.tokens["access"]
-    except Exception as exc:
-        raise RuntimeError(
-            "Google login succeeded but no access token is exposed. Check Streamlit Secrets: "
-            '`expose_tokens = ["access"]` must be under `[auth]`.'
-        ) from exc
+    token = st.session_state.get("google_oauth_token")
+    if not token:
+        raise RuntimeError("Google session has expired. Sign in again.")
+    return str(token)
+
+
+def google_logout() -> None:
+    for key in ["google_oauth_token", "google_oauth_email", "google_oauth_expires_at", "oauth_df", "oauth_context"]:
+        st.session_state.pop(key, None)
+    st.rerun()
 
 
 def connection_fetch_panel(access_token: str, session_prefix: str) -> pd.DataFrame:
@@ -475,6 +599,11 @@ def sample_csv_bytes() -> bytes:
 
 
 # ----------------------------- UI -----------------------------------------
+try:
+    handle_google_oauth_callback()
+except Exception as exc:
+    st.error(str(exc))
+
 st.title("Keyword Cannibalization Finder")
 st.caption(
     "Find queries where multiple URLs compete for meaningful Google Search visibility. "
@@ -509,17 +638,16 @@ if source == "Sign in with Google":
             "The app requests read-only Search Console access."
         )
         try:
-            if st.button("Sign in with Google", type="primary"):
-                st.login()
-        except Exception:
-            st.error(
-                "Google OAuth is not configured for this app. You can still use the JSON or CSV options."
-            )
+            login_url = google_login_url()
+            st.link_button("Sign in with Google", login_url, type="primary")
+        except Exception as exc:
+            st.error(str(exc))
+            st.caption("You can still use the JSON or CSV options.")
     else:
         c1, c2 = st.columns([5, 1])
         c1.success(f"Connected as {user_email or 'Google user'}")
         if c2.button("Log out"):
-            st.logout()
+            google_logout()
         try:
             token = oauth_access_token()
             df = connection_fetch_panel(token, "oauth")
