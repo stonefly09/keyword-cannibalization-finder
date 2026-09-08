@@ -2,3 +2,5 @@ streamlit==1.63.0
 pandas>=2.2
 requests>=2.32
 google-auth>=2.35
+
+beautifulsoup4>=4.12

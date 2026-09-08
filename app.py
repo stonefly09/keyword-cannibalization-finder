@@ -7,11 +7,13 @@ import re
 import secrets
 import time
 from datetime import date, timedelta
+from difflib import SequenceMatcher
 from urllib.parse import quote, urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 
@@ -109,19 +111,21 @@ def aggregate_query_page(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def score_candidate(total_impressions: float, second_share: float, pos1: float, pos2: float) -> int:
-    """Heuristic priority score. This is not a Google metric."""
+def risk_score(total_impressions: float, second_share: float, pos1: float, pos2: float, url_count: int) -> int:
+    """Internal heuristic used to order issues. It is not a Google metric."""
     score = 0.0
-    score += 45 * min(second_share / 0.50, 1.0)
+    score += 40 * min(second_share / 0.40, 1.0)
     score += 20 * min(total_impressions / 1000.0, 1.0)
     if pos1 <= 20 and pos2 <= 20:
         score += 20
     if abs(pos1 - pos2) <= 5:
         score += 15
+    if url_count >= 3:
+        score += 5
     return int(round(min(score, 100)))
 
 
-def severity_from_score(score: int) -> str:
+def risk_label(score: int) -> str:
     if score >= 70:
         return "High"
     if score >= 45:
@@ -129,45 +133,67 @@ def severity_from_score(score: int) -> str:
     return "Low"
 
 
-def conflict_type(primary_pos: float, secondary_pos: float, secondary_share: float) -> str:
-    if primary_pos <= 20 and secondary_pos <= 20 and secondary_share >= 0.20:
-        return "Likely conflict"
-    if abs(primary_pos - secondary_pos) <= 5 and secondary_share >= 0.10:
-        return "Possible conflict"
-    return "Overlap to review"
+def classify_overlap(primary_pos: float, secondary_pos: float, primary_share: float, secondary_share: float) -> str:
+    gap = abs(primary_pos - secondary_pos)
+    both_top20 = primary_pos <= 20 and secondary_pos <= 20
+    if secondary_share >= 0.25 and both_top20 and gap <= 5:
+        return "Likely Cannibalization"
+    if secondary_share >= 0.15 and (both_top20 or gap <= 7):
+        return "Possible Cannibalization"
+    if secondary_share >= 0.08:
+        return "Minor Overlap"
+    return "No Action Needed"
 
 
-def recommendation(primary_pos: float, secondary_pos: float, secondary_share: float) -> str:
-    if primary_pos <= 10 and secondary_pos <= 10 and secondary_share >= 0.20:
-        return (
-            "Compare intent first. If both pages answer the same intent, choose one primary URL and "
-            "consider consolidation/redirect; otherwise differentiate titles, headings and internal anchors."
-        )
-    if primary_pos <= 10 and secondary_pos > 10:
-        return (
-            "Protect the stronger URL. Retarget the secondary page to a distinct intent and strengthen "
-            "internal links toward the primary page if the overlap is accidental."
-        )
-    if secondary_share >= 0.30:
-        return (
-            "Visibility is strongly split. Review content similarity, intent and internal linking; "
-            "consolidate only when both URLs serve essentially the same search intent."
-        )
-    return (
-        "Review the overlap before changing anything. Differentiate targeting if the pages serve "
-        "different intents; consolidate only if they are genuinely redundant."
-    )
+def confidence_label(status: str, total_impressions: float, secondary_impressions: float, secondary_share: float) -> str:
+    if status == "Likely Cannibalization" and total_impressions >= 100 and secondary_impressions >= 25 and secondary_share >= 0.25:
+        return "Strong"
+    if status in {"Likely Cannibalization", "Possible Cannibalization"} and total_impressions >= 50:
+        return "Moderate"
+    if status == "No Action Needed" and secondary_share < 0.05:
+        return "Strong"
+    return "Weak"
 
 
-def detect_cannibalization(
-    df: pd.DataFrame,
+def evidence_text(primary_pos: float, secondary_pos: float, primary_share: float, secondary_share: float, url_count: int) -> str:
+    parts = [f"{url_count} ranking URLs", f"secondary URL has {secondary_share:.0%} of impressions"]
+    if primary_pos <= 20 and secondary_pos <= 20:
+        parts.append("both main URLs rank in Top 20")
+    gap = abs(primary_pos - secondary_pos)
+    if gap <= 5:
+        parts.append(f"positions are only {gap:.1f} apart")
+    if primary_share >= 0.75:
+        parts.append(f"primary URL dominates at {primary_share:.0%}")
+    return " • ".join(parts)
+
+
+def action_type(status: str) -> str:
+    return {
+        "Likely Cannibalization": "Review for consolidation",
+        "Possible Cannibalization": "Retarget / differentiate",
+        "Minor Overlap": "Monitor",
+        "No Action Needed": "No action",
+    }.get(status, "Review")
+
+
+def base_action(status: str, primary_pos: float, secondary_pos: float, secondary_share: float) -> str:
+    if status == "Likely Cannibalization":
+        return "Review intent. If the pages satisfy the same intent, consolidate; if not, retarget the weaker page and clarify internal links."
+    if status == "Possible Cannibalization":
+        return "Compare intent, titles/H1s and internal anchors. Retarget the weaker URL if the overlap is accidental."
+    if status == "Minor Overlap":
+        return "Monitor. No major change unless URL switching or very high page-intent similarity is detected."
+    return "No action recommended. One URL appears to dominate the query; keep monitoring."
+
+
+def detect_cannibalization_qp(
+    qp: pd.DataFrame,
     min_total_impressions: int = 50,
-    min_secondary_share: float = 0.10,
-    min_secondary_impressions: int = 10,
+    min_secondary_impressions: int = 5,
     max_position: float = 100.0,
     exclude_regex: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    qp = aggregate_query_page(df)
+    qp = qp.copy()
     qp = qp[qp["position"] <= max_position]
 
     if exclude_regex.strip():
@@ -192,24 +218,26 @@ def detect_cannibalization(
 
         primary = group.iloc[0]
         secondary = group.iloc[1]
-        primary_share = float(primary["impressions"] / total_imp) if total_imp else 0.0
-        secondary_share = float(secondary["impressions"] / total_imp) if total_imp else 0.0
-
-        if secondary["impressions"] < min_secondary_impressions or secondary_share < min_secondary_share:
+        if float(secondary["impressions"]) < min_secondary_impressions:
             continue
 
+        primary_share = float(primary["impressions"] / total_imp) if total_imp else 0.0
+        secondary_share = float(secondary["impressions"] / total_imp) if total_imp else 0.0
         primary_pos = float(primary["position"])
         secondary_pos = float(secondary["position"])
-        score = score_candidate(total_imp, secondary_share, primary_pos, secondary_pos)
-        severity = severity_from_score(score)
+        url_count = int(group["page"].nunique())
+        score = risk_score(total_imp, secondary_share, primary_pos, secondary_pos, url_count)
+        status = classify_overlap(primary_pos, secondary_pos, primary_share, secondary_share)
+        confidence = confidence_label(status, total_imp, float(secondary["impressions"]), secondary_share)
 
         summary_rows.append(
             {
                 "query": query,
-                "severity": severity,
-                "conflict_type": conflict_type(primary_pos, secondary_pos, secondary_share),
-                "score": score,
-                "urls": int(group["page"].nunique()),
+                "status": status,
+                "risk": risk_label(score),
+                "confidence": confidence,
+                "risk_score": score,
+                "ranking_urls": url_count,
                 "clicks": round(total_clicks, 0),
                 "impressions": round(total_imp, 0),
                 "primary_url": primary["page"],
@@ -219,16 +247,19 @@ def detect_cannibalization(
                 "competing_position": round(secondary_pos, 2),
                 "competing_impression_share": round(secondary_share, 4),
                 "position_gap": round(abs(primary_pos - secondary_pos), 2),
-                "recommendation": recommendation(primary_pos, secondary_pos, secondary_share),
+                "why_flagged": evidence_text(primary_pos, secondary_pos, primary_share, secondary_share, url_count),
+                "action": action_type(status),
+                "recommended_action": base_action(status, primary_pos, secondary_pos, secondary_share),
             }
         )
 
-        for _, row in group.iterrows():
+        for rank, (_, row) in enumerate(group.iterrows(), start=1):
             detail_rows.append(
                 {
                     "query": query,
-                    "severity": severity,
-                    "score": score,
+                    "status": status,
+                    "risk": risk_label(score),
+                    "role": "Primary" if rank == 1 else f"Competitor #{rank-1}",
                     "page": row["page"],
                     "clicks": round(float(row["clicks"]), 0),
                     "impressions": round(float(row["impressions"]), 0),
@@ -242,25 +273,171 @@ def detect_cannibalization(
     details = pd.DataFrame(detail_rows)
 
     if not summary.empty:
-        severity_order = pd.Categorical(
-            summary["severity"], categories=["High", "Medium", "Low"], ordered=True
+        status_order = pd.Categorical(
+            summary["status"],
+            categories=["Likely Cannibalization", "Possible Cannibalization", "Minor Overlap", "No Action Needed"],
+            ordered=True,
         )
         summary = (
-            summary.assign(_sev=severity_order)
-            .sort_values(["_sev", "score", "impressions"], ascending=[True, False, False])
-            .drop(columns="_sev")
+            summary.assign(_status=status_order)
+            .sort_values(["_status", "risk_score", "impressions"], ascending=[True, False, False])
+            .drop(columns="_status")
             .reset_index(drop=True)
         )
-
     return summary, details
 
+
+def detect_cannibalization(
+    df: pd.DataFrame,
+    min_total_impressions: int = 50,
+    min_secondary_impressions: int = 5,
+    max_position: float = 100.0,
+    exclude_regex: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return detect_cannibalization_qp(
+        aggregate_query_page(df), min_total_impressions, min_secondary_impressions, max_position, exclude_regex
+    )
+
+
+def _simple_stem(token: str) -> str:
+    token = re.sub(r"[^a-z0-9]", "", token.lower())
+    if len(token) > 5 and token.endswith("ies"):
+        token = token[:-3] + "y"
+    elif len(token) > 5 and token.endswith("ed"):
+        token = token[:-2]
+        if len(token) > 2 and token[-1] == token[-2]:
+            token = token[:-1]
+    elif len(token) > 5 and token.endswith("ing"):
+        token = token[:-3]
+        if len(token) > 2 and token[-1] == token[-2]:
+            token = token[:-1]
+    elif len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        token = token[:-1]
+    return token
+
+
+def _variant_key(query: str) -> str:
+    query = re.sub(r"[-_/]+", " ", normalize_query(query))
+    tokens = [_simple_stem(t) for t in re.findall(r"[a-z0-9]+", query)]
+    return "".join(t for t in tokens if t)
+
+
+def build_query_families(qp: pd.DataFrame, similarity_threshold: float = 0.86) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Groups close spelling/plural/hyphen variants; deliberately conservative, not semantic clustering."""
+    q_imp = qp.groupby("query", as_index=False)["impressions"].sum().sort_values("impressions", ascending=False)
+    buckets: dict[str, list[tuple[str, str]]] = {}
+    mapping: dict[str, str] = {}
+    members: dict[str, list[str]] = {}
+
+    for row in q_imp.itertuples(index=False):
+        query = str(row.query)
+        key = _variant_key(query)
+        bucket_key = key[:4]
+        chosen = None
+        for rep_query, rep_key in buckets.get(bucket_key, []):
+            ratio = SequenceMatcher(None, key, rep_key).ratio()
+            contained = (key in rep_key or rep_key in key) and abs(len(key) - len(rep_key)) <= 4
+            if ratio >= similarity_threshold or contained:
+                chosen = rep_query
+                break
+        if chosen is None:
+            chosen = query
+            buckets.setdefault(bucket_key, []).append((query, key))
+            members[chosen] = []
+        mapping[query] = chosen
+        members.setdefault(chosen, []).append(query)
+
+    work = qp.copy()
+    work["family"] = work["query"].map(mapping)
+    rows = []
+    for (family, page), group in work.groupby(["family", "page"]):
+        impressions = float(group["impressions"].sum())
+        clicks = float(group["clicks"].sum())
+        rows.append({
+            "query": family,
+            "page": page,
+            "clicks": clicks,
+            "impressions": impressions,
+            "ctr": clicks / impressions if impressions else 0.0,
+            "position": weighted_position(group),
+        })
+    family_qp = pd.DataFrame(rows)
+    member_rows = []
+    for family, qs in members.items():
+        family_imp = float(q_imp[q_imp["query"].isin(qs)]["impressions"].sum())
+        member_rows.append({
+            "family": family,
+            "variant_count": len(qs),
+            "variants": " | ".join(qs[:12]) + (" | …" if len(qs) > 12 else ""),
+            "family_impressions": round(family_imp, 0),
+        })
+    return family_qp, pd.DataFrame(member_rows)
+
+
+STOPWORDS = {
+    "a","an","and","are","as","at","be","by","for","from","how","in","is","it","of","on","or","that","the","this","to","what","when","where","which","with","your","you"
+}
+
+
+def _text_tokens(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]{2,}", (text or "").lower())
+    return {_simple_stem(w) for w in words if w not in STOPWORDS}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_page_profile(url: str) -> dict:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SEO-Cannibalization-Audit/1.0)"}
+    response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    h1 = soup.find("h1")
+    h1_text = h1.get_text(" ", strip=True) if h1 else ""
+    meta = soup.find("meta", attrs={"name": re.compile("description", re.I)})
+    desc = meta.get("content", "").strip() if meta else ""
+    body = " ".join(soup.stripped_strings)[:50000]
+    return {"url": response.url, "title": title, "h1": h1_text, "description": desc, "body": body}
+
+
+def page_intent_similarity(url_a: str, url_b: str) -> tuple[int, dict, dict, dict]:
+    a = fetch_page_profile(url_a)
+    b = fetch_page_profile(url_b)
+    title_sim = _jaccard(_text_tokens(a["title"]), _text_tokens(b["title"]))
+    h1_sim = _jaccard(_text_tokens(a["h1"]), _text_tokens(b["h1"]))
+    desc_sim = _jaccard(_text_tokens(a["description"]), _text_tokens(b["description"]))
+    body_sim = _jaccard(_text_tokens(a["body"]), _text_tokens(b["body"]))
+    score = int(round(100 * (0.35 * title_sim + 0.25 * h1_sim + 0.10 * desc_sim + 0.30 * body_sim)))
+    components = {
+        "Title similarity": int(round(title_sim * 100)),
+        "H1 similarity": int(round(h1_sim * 100)),
+        "Meta similarity": int(round(desc_sim * 100)),
+        "Body-topic overlap": int(round(body_sim * 100)),
+    }
+    return score, components, a, b
+
+
+def intent_interpretation(score: int, status: str) -> tuple[str, str]:
+    if score >= 65 and status in {"Likely Cannibalization", "Possible Cannibalization"}:
+        return "High intent overlap", "Strong merge/consolidation candidate. Manually verify unique value before redirecting anything."
+    if score >= 40:
+        return "Moderate intent overlap", "Keep both only if their purposes are distinct; otherwise retarget the weaker page and clarify internal linking."
+    return "Low intent overlap", "Likely different intents. Prefer differentiation and internal-link cleanup over merging."
 
 def format_summary_for_display(summary: pd.DataFrame) -> pd.DataFrame:
     out = summary.copy()
     if out.empty:
         return out
     for col in ["primary_impression_share", "competing_impression_share"]:
-        out[col] = (out[col] * 100).round(1).astype(str) + "%"
+        if col in out.columns:
+            out[col] = (out[col] * 100).round(1).astype(str) + "%"
     return out
 
 
@@ -349,6 +526,85 @@ def fetch_gsc_data(
 
     return pd.DataFrame(all_rows)
 
+
+
+def fetch_gsc_daily_query(
+    access_token: str,
+    site_url: str,
+    query: str,
+    start_date: date,
+    end_date: date,
+    search_type: str = "web",
+) -> pd.DataFrame:
+    all_rows = []
+    start_row = 0
+    row_limit = 25_000
+    encoded_site = quote(site_url, safe="")
+    endpoint = f"{GSC_API_BASE}/sites/{encoded_site}/searchAnalytics/query"
+    while True:
+        body = {
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "dimensions": ["date", "page"],
+            "dimensionFilterGroups": [{"filters": [{"dimension": "query", "operator": "equals", "expression": query}]}],
+            "type": search_type,
+            "rowLimit": row_limit,
+            "startRow": start_row,
+            "dataState": "final",
+        }
+        response = requests.post(
+            endpoint,
+            headers={**auth_headers(access_token), "Content-Type": "application/json"},
+            json=body,
+            timeout=90,
+        )
+        if not response.ok:
+            raise api_error(response)
+        rows = response.json().get("rows", [])
+        if not rows:
+            break
+        for row in rows:
+            keys = row.get("keys", ["", ""])
+            all_rows.append({
+                "date": keys[0] if len(keys) > 0 else "",
+                "page": keys[1] if len(keys) > 1 else "",
+                "clicks": row.get("clicks", 0),
+                "impressions": row.get("impressions", 0),
+                "ctr": row.get("ctr", 0),
+                "position": row.get("position", 0),
+            })
+        if len(rows) < row_limit:
+            break
+        start_row += row_limit
+    return pd.DataFrame(all_rows)
+
+
+def url_switching_summary(daily: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    if daily.empty:
+        return {"switches": 0, "winning_urls": 0, "signal": "No data"}, pd.DataFrame()
+    winners = (
+        daily.sort_values(["date", "impressions", "clicks"], ascending=[True, False, False])
+        .groupby("date", as_index=False)
+        .first()
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    prev = None
+    switches = 0
+    for page in winners["page"]:
+        if prev is not None and page != prev:
+            switches += 1
+        prev = page
+    distinct = int(winners["page"].nunique())
+    if switches >= 5 and distinct >= 2:
+        signal = "Strong switching signal"
+    elif switches >= 2 and distinct >= 2:
+        signal = "Moderate switching signal"
+    elif distinct >= 2:
+        signal = "Weak switching signal"
+    else:
+        signal = "Stable primary URL"
+    return {"switches": switches, "winning_urls": distinct, "signal": signal, "days": len(winners)}, winners
 
 def service_account_token(uploaded_file) -> tuple[str, str]:
     try:
@@ -514,6 +770,7 @@ def connection_fetch_panel(access_token: str, session_prefix: str) -> pd.DataFra
         st.warning("No Search Console properties were returned for these credentials.")
         return pd.DataFrame()
 
+    st.session_state[f"{session_prefix}_access_token"] = access_token
     property_lookup = {p.get("siteUrl", ""): p.get("permissionLevel", "") for p in properties}
     site_url = st.selectbox(
         "Search Console property", list(property_lookup.keys()), key=f"{session_prefix}_site"
@@ -606,16 +863,22 @@ except Exception as exc:
 
 st.title("Keyword Cannibalization Finder")
 st.caption(
-    "Find queries where multiple URLs compete for meaningful Google Search visibility. "
-    "Use Google sign-in, a service-account JSON key, or a query × page CSV."
+    "Find meaningful URL conflicts in Google Search Console, separate real cannibalization from harmless overlap, "
+    "and get evidence before making SEO changes."
 )
 
-with st.expander("What counts as a cannibalization candidate?", expanded=False):
+with st.expander("How this tool decides whether an overlap is a real problem", expanded=False):
     st.markdown(
         """
-A keyword ranking through two URLs is **not automatically a problem**. This tool prioritizes overlaps where the second URL has meaningful impressions and visibility.
+**Multiple URLs ranking for one query is not automatically cannibalization.** The tool first finds URL overlap, then evaluates:
 
-The score considers the competing URL's impression share, total demand, whether both URLs rank in the top 20, and how close their positions are. Always compare search intent before merging or redirecting pages.
+- how much impression share the second URL receives,
+- whether both main URLs rank in the Top 20,
+- how close their positions are,
+- how many URLs are involved,
+- and, on demand, whether Google switches the winning URL over time and whether the pages appear to target the same intent.
+
+The internal **risk score** is used only for sorting; it is **not a Google metric**. The main output is the evidence-based status: **Likely Cannibalization, Possible Cannibalization, Minor Overlap, or No Action Needed**.
         """
     )
 
@@ -627,19 +890,15 @@ source = st.radio(
 
 st.divider()
 df = pd.DataFrame()
+active_session_prefix = None
 
 if source == "Sign in with Google":
     st.subheader("1. Connect your Google Search Console account")
     logged_in, user_email = oauth_status()
-
     if not logged_in:
-        st.info(
-            "Use the Google account that already has access to your Search Console property. "
-            "The app requests read-only Search Console access."
-        )
+        st.info("Use the Google account that already has access to your Search Console property. Read-only GSC access is requested.")
         try:
-            login_url = google_login_url()
-            st.link_button("Sign in with Google", login_url, type="primary")
+            st.link_button("Sign in with Google", google_login_url(), type="primary")
         except Exception as exc:
             st.error(str(exc))
             st.caption("You can still use the JSON or CSV options.")
@@ -649,28 +908,23 @@ if source == "Sign in with Google":
         if c2.button("Log out"):
             google_logout()
         try:
-            token = oauth_access_token()
-            df = connection_fetch_panel(token, "oauth")
+            df = connection_fetch_panel(oauth_access_token(), "oauth")
+            active_session_prefix = "oauth"
         except Exception as exc:
             st.error(str(exc))
 
 elif source == "Upload service-account JSON":
     st.subheader("1. Upload a Google service-account JSON key")
-    st.caption(
-        "The JSON is used in memory for this session and is not written to your GitHub repository."
-    )
+    st.caption("The JSON is used in memory for this session and is not written to GitHub.")
     uploaded_json = st.file_uploader("Upload JSON key", type=["json"], key="service_json")
-
     if uploaded_json:
         try:
             token, service_email = service_account_token(uploaded_json)
             st.success("Service account authenticated.")
             st.code(service_email, language=None)
-            st.info(
-                "This service-account email must have access to the Search Console property. "
-                "If you cannot add it in GSC, use 'Sign in with Google' instead."
-            )
+            st.info("This service-account email must have Search Console property access.")
             df = connection_fetch_panel(token, "service")
+            active_session_prefix = "service"
         except Exception as exc:
             st.error(str(exc))
 
@@ -678,15 +932,9 @@ else:
     st.subheader("1. Upload query × page data")
     st.write("Required columns: `query`, `page`, `clicks`, `impressions`, `ctr`, `position`.")
     st.warning(
-        "The normal Search Console export creates separate Queries.csv and Pages.csv files. "
-        "Those files cannot be reliably joined for cannibalization because the query → URL relationship is missing."
+        "Separate Queries.csv and Pages.csv exports cannot be reliably joined because the query → URL relationship is missing."
     )
-    st.download_button(
-        "Download sample CSV format",
-        data=sample_csv_bytes(),
-        file_name="query_page_sample.csv",
-        mime="text/csv",
-    )
+    st.download_button("Download sample CSV format", data=sample_csv_bytes(), file_name="query_page_sample.csv", mime="text/csv")
     uploaded_csv = st.file_uploader("Upload CSV", type=["csv"], key="query_page_csv")
     if uploaded_csv:
         try:
@@ -694,10 +942,7 @@ else:
             normalized = normalize_csv_columns(df)
             missing = REQUIRED_COLUMNS.difference(normalized.columns)
             if missing:
-                st.error(
-                    "This CSV is missing: " + ", ".join(sorted(missing)) + ". "
-                    "You need query and page together in the same export."
-                )
+                st.error("This CSV is missing: " + ", ".join(sorted(missing)) + ". Query and page must be in the same rows.")
                 df = pd.DataFrame()
             else:
                 df = normalized
@@ -708,28 +953,17 @@ else:
 if not df.empty:
     st.divider()
     st.subheader("2. Detection settings")
-    c1, c2, c3, c4 = st.columns(4)
-    min_total_impressions = c1.number_input(
-        "Min total impressions/query", min_value=1, value=50, step=10
-    )
-    min_secondary_share_pct = c2.slider(
-        "Min competing URL share", min_value=1, max_value=50, value=10, step=1
-    )
-    min_secondary_impressions = c3.number_input(
-        "Min competing URL impressions", min_value=1, value=10, step=5
-    )
-    max_position = c4.number_input(
-        "Max avg position to consider", min_value=1, max_value=100, value=50, step=5
-    )
-    exclude_regex = st.text_input(
-        "Optional query exclusions (regex)", placeholder="brandname|login|support"
-    )
+    c1, c2, c3 = st.columns(3)
+    min_total_impressions = c1.number_input("Min total impressions/query", min_value=1, value=50, step=10)
+    min_secondary_impressions = c2.number_input("Min secondary URL impressions", min_value=1, value=5, step=5)
+    max_position = c3.number_input("Max avg position to consider", min_value=1, max_value=100, value=50, step=5)
+    exclude_regex = st.text_input("Optional query exclusions (regex)", placeholder="brandname|login|support")
 
     try:
-        summary, details = detect_cannibalization(
-            df,
+        qp = aggregate_query_page(df)
+        summary, details = detect_cannibalization_qp(
+            qp,
             min_total_impressions=int(min_total_impressions),
-            min_secondary_share=min_secondary_share_pct / 100,
             min_secondary_impressions=int(min_secondary_impressions),
             max_position=float(max_position),
             exclude_regex=exclude_regex,
@@ -738,109 +972,197 @@ if not df.empty:
         st.error(str(exc))
         st.stop()
 
-    st.subheader("3. Cannibalization candidates")
-
+    st.subheader("3. Cannibalization audit")
     if summary.empty:
-        st.success("No candidates matched the current thresholds.")
+        st.success("No multi-URL overlaps matched the current thresholds.")
     else:
-        high_count = int((summary["severity"] == "High").sum())
-        medium_count = int((summary["severity"] == "Medium").sum())
-        low_count = int((summary["severity"] == "Low").sum())
-        total_imp = int(summary["impressions"].sum())
+        likely = int((summary["status"] == "Likely Cannibalization").sum())
+        possible = int((summary["status"] == "Possible Cannibalization").sum())
+        minor = int((summary["status"] == "Minor Overlap").sum())
+        no_action = int((summary["status"] == "No Action Needed").sum())
+        action_queries = set(summary.loc[summary["status"].isin(["Likely Cannibalization", "Possible Cannibalization"]), "query"])
+        action_urls = set(details.loc[details["query"].isin(action_queries), "page"]) if not details.empty else set()
 
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Candidates", f"{len(summary):,}")
-        m2.metric("High", f"{high_count:,}")
-        m3.metric("Medium", f"{medium_count:,}")
-        m4.metric("Low", f"{low_count:,}")
-        m5.metric("Candidate impressions", f"{total_imp:,}")
+        m1.metric("Likely", f"{likely:,}")
+        m2.metric("Possible", f"{possible:,}")
+        m3.metric("Minor overlap", f"{minor:,}")
+        m4.metric("No action", f"{no_action:,}")
+        m5.metric("URLs to review", f"{len(action_urls):,}")
 
-        f1, f2, f3 = st.columns([2, 1, 1])
-        query_filter = f1.text_input("Filter queries", placeholder="nas storage")
-        severity_filter = f2.multiselect(
-            "Severity", ["High", "Medium", "Low"], default=["High", "Medium", "Low"]
-        )
-        min_score_filter = f3.slider("Minimum score", 0, 100, 0)
+        tab_queries, tab_families = st.tabs(["Exact-query conflicts", "Keyword-family view"])
 
-        filtered = summary.copy()
-        if query_filter.strip():
-            filtered = filtered[
-                filtered["query"].str.contains(query_filter.strip(), case=False, na=False)
+        with tab_queries:
+            f1, f2, f3 = st.columns([2, 2, 1])
+            query_filter = f1.text_input("Filter queries", placeholder="air gapped backup", key="exact_filter")
+            status_options = ["Likely Cannibalization", "Possible Cannibalization", "Minor Overlap", "No Action Needed"]
+            status_filter = f2.multiselect(
+                "Status",
+                status_options,
+                default=["Likely Cannibalization", "Possible Cannibalization"],
+                key="status_filter",
+            )
+            risk_filter = f3.multiselect("Risk", ["High", "Medium", "Low"], default=["High", "Medium", "Low"], key="risk_filter")
+
+            filtered = summary.copy()
+            if query_filter.strip():
+                filtered = filtered[filtered["query"].str.contains(query_filter.strip(), case=False, na=False)]
+            filtered = filtered[filtered["status"].isin(status_filter) & filtered["risk"].isin(risk_filter)]
+
+            display_cols = [
+                "query", "status", "risk", "confidence", "ranking_urls", "impressions",
+                "primary_url", "competing_url", "primary_position", "competing_position",
+                "position_gap", "why_flagged", "action", "recommended_action"
             ]
-        filtered = filtered[
-            filtered["severity"].isin(severity_filter) & (filtered["score"] >= min_score_filter)
-        ]
+            st.dataframe(
+                format_summary_for_display(filtered)[display_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "query": st.column_config.TextColumn("Query"),
+                    "status": st.column_config.TextColumn("Assessment", help="Evidence-based classification; multiple URLs alone are not considered cannibalization."),
+                    "risk": st.column_config.TextColumn("Risk", help="High/Medium/Low priority derived from visibility split, demand and ranking proximity."),
+                    "confidence": st.column_config.TextColumn("Confidence", help="Strength of the evidence supporting the assessment."),
+                    "ranking_urls": st.column_config.NumberColumn("Ranking URLs", help="Unique URLs from your site that received impressions for this query."),
+                    "why_flagged": st.column_config.TextColumn("Why flagged"),
+                    "action": st.column_config.TextColumn("Action"),
+                    "recommended_action": st.column_config.TextColumn("Recommended next step"),
+                },
+            )
 
-        display_cols = [
-            "query",
-            "severity",
-            "conflict_type",
-            "score",
-            "urls",
-            "impressions",
-            "primary_url",
-            "primary_position",
-            "primary_impression_share",
-            "competing_url",
-            "competing_position",
-            "competing_impression_share",
-            "position_gap",
-            "recommendation",
-        ]
-        st.dataframe(
-            format_summary_for_display(filtered)[display_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+        with tab_families:
+            st.caption("Groups close spelling/plural/hyphen variants (for example, air-gapped / air gapped / airgapped). This is conservative lexical grouping, not semantic keyword clustering.")
+            try:
+                family_qp, family_members = build_query_families(qp)
+                family_summary, family_details = detect_cannibalization_qp(
+                    family_qp,
+                    min_total_impressions=int(min_total_impressions),
+                    min_secondary_impressions=int(min_secondary_impressions),
+                    max_position=float(max_position),
+                    exclude_regex=exclude_regex,
+                )
+                family_summary = family_summary.merge(family_members, left_on="query", right_on="family", how="left")
+                family_summary = family_summary[family_summary["variant_count"].fillna(1) > 1]
+                if family_summary.empty:
+                    st.info("No multi-query keyword families with URL overlap were found under the current thresholds.")
+                else:
+                    fam_cols = ["query", "variant_count", "variants", "status", "risk", "confidence", "ranking_urls", "impressions", "primary_url", "competing_url", "why_flagged", "action"]
+                    st.dataframe(
+                        family_summary[fam_cols].rename(columns={"query": "family"}),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "family": st.column_config.TextColumn("Keyword family"),
+                            "variant_count": st.column_config.NumberColumn("Variants"),
+                            "ranking_urls": st.column_config.NumberColumn("Ranking URLs"),
+                        },
+                    )
+            except Exception as exc:
+                st.warning(f"Keyword-family grouping could not be built: {exc}")
 
+        st.divider()
         d1, d2, d3 = st.columns(3)
-        d1.download_button(
-            "Download candidate summary",
-            data=summary.to_csv(index=False).encode("utf-8"),
-            file_name="keyword_cannibalization_candidates.csv",
-            mime="text/csv",
-        )
-        d2.download_button(
-            "Download URL-level details",
-            data=details.to_csv(index=False).encode("utf-8"),
-            file_name="keyword_cannibalization_details.csv",
-            mime="text/csv",
-        )
-        d3.download_button(
-            "Download source query × page data",
-            data=aggregate_query_page(df).to_csv(index=False).encode("utf-8"),
-            file_name="query_page_source_data.csv",
-            mime="text/csv",
-        )
+        d1.download_button("Download audit summary", data=summary.to_csv(index=False).encode("utf-8"), file_name="keyword_cannibalization_audit.csv", mime="text/csv")
+        d2.download_button("Download URL-level details", data=details.to_csv(index=False).encode("utf-8"), file_name="keyword_cannibalization_url_details.csv", mime="text/csv")
+        d3.download_button("Download source query × page data", data=qp.to_csv(index=False).encode("utf-8"), file_name="query_page_source_data.csv", mime="text/csv")
 
-        st.subheader("4. Inspect one query")
-        selected_query = st.selectbox("Query", summary["query"].tolist())
+        st.subheader("4. Investigate one query")
+        review_pool = summary[summary["status"].isin(["Likely Cannibalization", "Possible Cannibalization", "Minor Overlap"])]
+        if review_pool.empty:
+            review_pool = summary
+        selected_query = st.selectbox("Query", review_pool["query"].tolist())
         selected_summary = summary[summary["query"] == selected_query].iloc[0]
-        query_details = (
-            details[details["query"] == selected_query]
-            .copy()
-            .sort_values("impressions", ascending=False)
-        )
+        query_details = details[details["query"] == selected_query].copy().sort_values("impressions", ascending=False)
 
         a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Priority score", int(selected_summary["score"]))
-        a2.metric("Severity", selected_summary["severity"])
-        a3.metric("Ranking URLs", int(selected_summary["urls"]))
-        a4.metric("Position gap", selected_summary["position_gap"])
-        st.info(selected_summary["recommendation"])
-
-        chart_df = query_details.set_index("page")[["impressions"]]
-        st.bar_chart(chart_df)
+        a1.metric("Assessment", selected_summary["status"])
+        a2.metric("Risk", selected_summary["risk"])
+        a3.metric("Confidence", selected_summary["confidence"])
+        a4.metric("Ranking URLs", int(selected_summary["ranking_urls"]))
+        st.info("Why flagged: " + selected_summary["why_flagged"])
+        st.success("Recommended next step: " + selected_summary["recommended_action"])
 
         display_details = query_details.copy()
         display_details["ctr"] = (display_details["ctr"] * 100).round(2).astype(str) + "%"
-        display_details["impression_share"] = (
-            display_details["impression_share"] * 100
-        ).round(1).astype(str) + "%"
-        st.dataframe(display_details, use_container_width=True, hide_index=True)
+        display_details["impression_share"] = (display_details["impression_share"] * 100).round(1).astype(str) + "%"
+        st.markdown("#### All URLs ranking for this query")
+        st.dataframe(
+            display_details[["role", "page", "clicks", "impressions", "ctr", "position", "impression_share"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "role": st.column_config.TextColumn("Role"),
+                "page": st.column_config.LinkColumn("URL", display_text="Open page"),
+                "impression_share": st.column_config.TextColumn("Impression share"),
+            },
+        )
+
+        top_two = query_details.head(2)
+        if len(top_two) >= 2:
+            primary_url = str(top_two.iloc[0]["page"])
+            competing_url = str(top_two.iloc[1]["page"])
+            col_left, col_right = st.columns(2)
+            with col_left:
+                st.markdown("**Primary URL**")
+                st.write(primary_url)
+                st.caption(f"Position {top_two.iloc[0]['position']} · Share {top_two.iloc[0]['impression_share']:.1%}")
+            with col_right:
+                st.markdown("**Main competing URL**")
+                st.write(competing_url)
+                st.caption(f"Position {top_two.iloc[1]['position']} · Share {top_two.iloc[1]['impression_share']:.1%}")
+
+            st.markdown("#### Page-intent check")
+            st.caption("Optional on-page comparison using title, H1, meta description and visible page text. It is a heuristic, not a substitute for manual SERP-intent review.")
+            if st.button("Analyze intent similarity", key=f"intent_{selected_query}"):
+                with st.spinner("Reading both pages and comparing intent signals..."):
+                    try:
+                        sim, components, profile_a, profile_b = page_intent_similarity(primary_url, competing_url)
+                        label, intent_action = intent_interpretation(sim, selected_summary["status"])
+                        i1, i2 = st.columns([1, 3])
+                        i1.metric("Intent similarity", f"{sim}%")
+                        i2.info(f"{label}. {intent_action}")
+                        st.write(components)
+                        p1, p2 = st.columns(2)
+                        with p1:
+                            st.markdown("**Primary page signals**")
+                            st.write("Title:", profile_a["title"] or "—")
+                            st.write("H1:", profile_a["h1"] or "—")
+                        with p2:
+                            st.markdown("**Competing page signals**")
+                            st.write("Title:", profile_b["title"] or "—")
+                            st.write("H1:", profile_b["h1"] or "—")
+                    except Exception as exc:
+                        st.warning(f"Could not analyze both pages: {exc}")
+
+        st.markdown("#### URL-switching check")
+        if active_session_prefix and st.session_state.get(f"{active_session_prefix}_context"):
+            ctx = st.session_state[f"{active_session_prefix}_context"]
+            token = st.session_state.get(f"{active_session_prefix}_access_token")
+            if st.button("Check daily URL switching", key=f"switch_{selected_query}"):
+                with st.spinner("Checking which URL won each day in Search Console..."):
+                    try:
+                        daily = fetch_gsc_daily_query(
+                            token,
+                            ctx["site_url"],
+                            selected_query,
+                            date.fromisoformat(ctx["start_date"]),
+                            date.fromisoformat(ctx["end_date"]),
+                            ctx["search_type"],
+                        )
+                        switch_info, winners = url_switching_summary(daily)
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric("URL switches", switch_info.get("switches", 0))
+                        s2.metric("Distinct daily winners", switch_info.get("winning_urls", 0))
+                        s3.metric("Switching signal", switch_info.get("signal", "No data"))
+                        if not winners.empty:
+                            st.caption("Daily winner = URL with the most impressions for the query on that day.")
+                            st.dataframe(winners[["date", "page", "impressions", "clicks", "position"]], use_container_width=True, hide_index=True)
+                    except Exception as exc:
+                        st.warning(f"Could not fetch daily switching data: {exc}")
+        else:
+            st.caption("URL switching requires a live Search Console connection. CSV mode can still use the overlap and intent checks.")
 
 st.divider()
 st.caption(
-    "v3 · Google OAuth + service-account JSON + CSV · query × page overlap scoring. "
-    "Planned next: daily URL-switching detection and page-intent similarity."
+    "v6 · Evidence-first cannibalization audit · exact-query overlap + keyword families + on-page intent similarity + on-demand URL switching."
 )
